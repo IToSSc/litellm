@@ -112,6 +112,7 @@ from litellm.proxy.management_endpoints.common_utils import (
 from litellm.proxy.management_endpoints.organization_endpoints import (
     add_member_to_organization,
 )
+from litellm.proxy.management_endpoints.router_weights import validate_router_settings_weights
 from litellm.proxy.management_endpoints.tag_management_endpoints import (
     get_daily_activity,
 )
@@ -1287,6 +1288,7 @@ async def new_team(
             create_audit_log_for_update,
             general_settings,
             litellm_proxy_admin_name,
+            llm_router,
             prisma_client,
             user_api_key_cache,
         )
@@ -1459,6 +1461,13 @@ async def new_team(
             team_id=data.team_id,
             team_alias=data.team_alias,
             user_api_key_dict=user_api_key_dict,
+        )
+
+        await validate_router_settings_weights(
+            data.router_settings,
+            team_id=data.team_id,
+            prisma_client=prisma_client,
+            llm_router=llm_router,
         )
 
         ## ADD TO MODEL TABLE
@@ -2072,6 +2081,13 @@ async def update_team(
         await _verify_team_access(
             team_obj=LiteLLM_TeamTable.model_validate(existing_team_row.model_dump()),
             user_api_key_dict=user_api_key_dict,
+        )
+
+        await validate_router_settings_weights(
+            data.router_settings,
+            team_id=data.team_id,
+            prisma_client=prisma_client,
+            llm_router=llm_router,
         )
 
         _existing_team_metadata: Final[object] = getattr(existing_team_row, "metadata", None)
