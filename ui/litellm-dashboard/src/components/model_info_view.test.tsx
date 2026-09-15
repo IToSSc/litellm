@@ -1091,6 +1091,36 @@ describe("ModelInfoView", () => {
     });
   });
 
+  it("offers opted-in creators only the router editor and withdraws it after permission revocation", async () => {
+    mockUseModelsInfo.mockReturnValue({
+      data: {
+        data: [
+          {
+            ...defaultModelData,
+            model_info: { ...defaultModelData.model_info, team_id: "team-1", created_by: "member" },
+            litellm_params: { model: "auto_router/complexity_router", complexity_router_config: { tiers: {} } },
+          },
+        ],
+      },
+      isLoading: false,
+    });
+    const memberTeam = {
+      team_id: "team-1",
+      team_member_permissions: ["/auto_router/manage"],
+      members_with_roles: [{ user_id: "member", role: "user" }],
+    };
+    mockUseTeams.mockReturnValue({ data: [memberTeam] });
+    const props = { ...DEFAULT_ADMIN_PROPS, userRole: "Internal User", userID: "member" };
+    const { rerender } = render(<ModelInfoView {...props} />, { wrapper });
+
+    expect(await screen.findByRole("button", { name: /edit auto router/i })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Edit Settings" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Delete Auto-Router" })).toBeDisabled();
+    mockUseTeams.mockReturnValue({ data: [{ ...memberTeam, team_member_permissions: [] }] });
+    rerender(<ModelInfoView {...props} />);
+    expect(screen.queryByRole("button", { name: /edit auto router/i })).not.toBeInTheDocument();
+  });
+
   it("does not offer Test Connection for semantic auto router models (no tier-based test exists yet)", async () => {
     const semanticAutoRouterModelData = {
       ...defaultModelData,

@@ -1,6 +1,6 @@
 /* @vitest-environment jsdom */
 import { render } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import AutoRoutersTabPanel from "./AutoRoutersTabPanel";
 
 const panelProps = vi.fn();
@@ -12,10 +12,12 @@ vi.mock("../components/AutoRouters/AutoRoutersPanel", () => ({
 }));
 
 const mockUseAuthorized = vi.fn();
+const mockUseTeams = vi.fn();
+const mockUseUISettings = vi.fn();
 vi.mock("@/app/(dashboard)/hooks/useAuthorized", () => ({ default: () => mockUseAuthorized() }));
-vi.mock("@/app/(dashboard)/hooks/teams/useTeams", () => ({ useTeams: () => ({ data: [] }) }));
+vi.mock("@/app/(dashboard)/hooks/teams/useTeams", () => ({ useTeams: () => mockUseTeams() }));
 vi.mock("@/app/(dashboard)/hooks/uiSettings/useUISettings", () => ({
-  useUISettings: () => ({ data: { values: {} } }),
+  useUISettings: () => mockUseUISettings(),
 }));
 
 const SESSION = { accessToken: "at", userRole: "Admin", userId: "u1", isViewOnly: false };
@@ -23,6 +25,29 @@ const SESSION = { accessToken: "at", userRole: "Admin", userId: "u1", isViewOnly
 const lastProps = () => panelProps.mock.calls.at(-1)?.[0] as { createScope: string };
 
 describe("AutoRoutersTabPanel", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockUseTeams.mockReturnValue({ data: [] });
+    mockUseUISettings.mockReturnValue({ data: { values: {} } });
+  });
+
+  it.each([false, true])("honors member auto-router opt-in when general model creation is disabled=%s", (disabled) => {
+    mockUseAuthorized.mockReturnValue({ ...SESSION, userRole: "Internal User" });
+    mockUseTeams.mockReturnValue({
+      data: [
+        {
+          team_id: "team-1",
+          members_with_roles: [{ user_id: "u1", role: "user" }],
+          team_member_permissions: ["/auto_router/manage"],
+        },
+      ],
+    });
+    mockUseUISettings.mockReturnValue({ data: { values: { disable_model_add_for_internal_users: disabled } } });
+    render(<AutoRoutersTabPanel />);
+
+    expect(lastProps().createScope).toBe("team-required");
+  });
+
   it("grants an unscoped create to a real proxy admin", () => {
     mockUseAuthorized.mockReturnValue(SESSION);
     render(<AutoRoutersTabPanel />);

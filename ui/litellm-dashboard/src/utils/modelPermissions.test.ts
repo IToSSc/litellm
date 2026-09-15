@@ -1,7 +1,14 @@
 import { describe, expect, it } from "vitest";
 
 import { Team } from "@/components/networking";
-import { canCreateModels, canModifyModel, modelCreationScope } from "./modelPermissions";
+import {
+  autoRouterCreationScope,
+  canCreateAutoRouterForTeam,
+  canCreateModels,
+  canEditAutoRouter,
+  canModifyModel,
+  modelCreationScope,
+} from "./modelPermissions";
 
 const teamWhere = (userId: string, role: string, teamId = "team-1"): Team[] =>
   [{ team_id: teamId, members_with_roles: [{ user_id: userId, user_email: "t@test.com", role }] }] as unknown as Team[];
@@ -109,5 +116,103 @@ describe("canModifyModel", () => {
   // team-scoped carve-out runs, so team-admin membership changes nothing here either.
   it("refuses a view-only user even when they admin the owning team", () => {
     expect(canModifyModel(VIEW_ONLY_ADMIN, teamWhere("u-viewer", "admin"), teamRow)).toBe(false);
+  });
+});
+
+describe("team member auto routers", () => {
+  const team = { ...teamWhere("u-member", "user")[0], team_member_permissions: ["/auto_router/manage"] };
+  const ownRouter = {
+    teamId: "team-1",
+    isDbModel: true,
+    createdBy: "u-member",
+    model: "auto_router/complexity_router",
+  };
+
+  it("grants creation and own configuration updates without granting general model management", () => {
+    expect(autoRouterCreationScope(MEMBER, { teams: [team], ...noLimits })).toBe("team-required");
+    expect(canEditAutoRouter(MEMBER, [team], ownRouter)).toBe(true);
+    expect(canCreateModels(MEMBER, { teams: [team], ...noLimits })).toBe(false);
+    expect(canModifyModel(MEMBER, [team], ownRouter)).toBe(false);
+  });
+
+  it.each([
+    { label: "default permissions", updatedTeam: { ...team, team_member_permissions: undefined } },
+    { label: "revoked permission", updatedTeam: { ...team, team_member_permissions: [] } },
+    { label: "removed membership", updatedTeam: { ...team, members_with_roles: [] } },
+    { label: "blocked team", updatedTeam: { ...team, blocked: true } },
+  ])("denies creation and editing with $label", ({ updatedTeam }) => {
+    expect(autoRouterCreationScope(MEMBER, { teams: [updatedTeam], ...noLimits })).toBe("forbidden");
+    expect(canEditAutoRouter(MEMBER, [updatedTeam], ownRouter)).toBe(false);
+  });
+
+  it.each([
+    { label: "peer ownership", origin: { ...ownRouter, createdBy: "peer" } },
+    { label: "foreign team", origin: { ...ownRouter, teamId: "other-team" } },
+    { label: "missing creator", origin: { ...ownRouter, createdBy: null } },
+    { label: "config-defined router", origin: { ...ownRouter, isDbModel: false } },
+    { label: "ordinary deployment", origin: { ...ownRouter, model: "openai/gpt-5" } },
+    { label: "semantic router", origin: { ...ownRouter, model: "auto_router/semantic" } },
+  ])("withholds member editing for $label", ({ origin }) => {
+    expect(canEditAutoRouter(MEMBER, [team], origin)).toBe(false);
+  });
+
+  it.each([
+    { ...MEMBER, isViewOnly: true },
+    { ...MEMBER, userID: null },
+    { ...MEMBER, userID: "" },
+  ])("rejects viewer and absent identities", (actor) => {
+    expect(autoRouterCreationScope(actor, { teams: [team], ...noLimits })).toBe("forbidden");
+    expect(canEditAutoRouter(actor, [team], { ...ownRouter, createdBy: actor.userID })).toBe(false);
+  });
+
+  it("checks the destination team for an actor who administers another team", () => {
+    const otherTeam = teamWhere("u-member", "admin", "admin-team")[0];
+    expect(canCreateAutoRouterForTeam(MEMBER, otherTeam)).toBe(true);
+    expect(canModifyModel(MEMBER, [team, otherTeam], ownRouter)).toBe(false);
+    expect(canEditAutoRouter(MEMBER, [team, otherTeam], ownRouter)).toBe(true);
+    expect(autoRouterCreationScope(MEMBER, { teams: [team], disabledForInternalUsers: true })).toBe("team-required");
+  });
+
+  describe.each([false, true])("general model creation disabled=%s", (disabledForInternalUsers) => {
+    describe.each([false, true])("team auto-router opt-in=%s", (optedIn) => {
+      it.each([
+        {
+          label: "proxy admin",
+          actor: PROXY_ADMIN,
+          teamRole: "user",
+          expectedModels: true,
+          expectedRouterScope: "unscoped-ok",
+        },
+        {
+          label: "team admin",
+          actor: TEAM_ADMIN,
+          teamRole: "admin",
+          expectedModels: !disabledForInternalUsers,
+          expectedRouterScope: disabledForInternalUsers ? "forbidden" : "team-required",
+        },
+        {
+          label: "member",
+          actor: MEMBER,
+          teamRole: "user",
+          expectedModels: false,
+          expectedRouterScope: optedIn ? "team-required" : "forbidden",
+        },
+        {
+          label: "viewer",
+          actor: VIEW_ONLY_ADMIN,
+          teamRole: "admin",
+          expectedModels: false,
+          expectedRouterScope: "forbidden",
+        },
+      ])("keeps the intended creation scope for $label", ({ actor, teamRole, expectedModels, expectedRouterScope }) => {
+        const grantedTeam = {
+          ...teamWhere(actor.userID, teamRole)[0],
+          team_member_permissions: optedIn ? ["/auto_router/manage"] : [],
+        };
+        const limits = { teams: [grantedTeam], disabledForInternalUsers };
+        expect(canCreateModels(actor, limits)).toBe(expectedModels);
+        expect(autoRouterCreationScope(actor, limits)).toBe(expectedRouterScope);
+      });
+    });
   });
 });

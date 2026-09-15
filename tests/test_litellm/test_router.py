@@ -4,9 +4,10 @@ import functools
 import json
 import logging
 import os
+import sys
 import threading
-from datetime import datetime
 from collections.abc import Awaitable, Callable, Mapping
+from datetime import datetime
 from types import SimpleNamespace
 from typing import Final, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -15,35 +16,36 @@ import httpx
 import openai
 import pytest
 import respx
-
-
+from fastapi import HTTPException
 
 import litellm
+from litellm import Router
 from litellm.caching.caching import DualCache
 from litellm.caching.redis_cache import _redis_circuit_breaker_guard
-from litellm import Router
 from litellm.exceptions import MidStreamFallbackError
 from litellm.integrations.custom_guardrail import CustomGuardrail
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLogging
-from litellm.llms.bedrock.common_utils import BedrockError
 from litellm.llms.anthropic.experimental_pass_through.messages.agentic_streaming_iterator import (
     SERVER_FULFILLED_TOOL_LEAK_ERROR_SSE_BYTES,
 )
-from litellm.types.llms.openai import ChatCompletionRequest
+from litellm.llms.bedrock.common_utils import BedrockError
+from litellm.models.access_group import LiteLLM_AccessGroupTable
+from litellm.proxy._types import LiteLLM_TeamTable, LitellmUserRoles, Member, ProxyException, UserAPIKeyAuth
 from litellm.router import (
     MAX_BUFFERED_PRE_CONTENT_ANTHROPIC_CHUNKS,
     FallbackAwareAnthropicMessagesStream,
     _anthropic_stream_commits_now,
+    _anthropic_stream_error_is_gateway_verdict,
     _anthropic_stream_fallback_error_for_raised,
+    _anthropic_stream_forwards_ping_live,
     _anthropic_stream_raised_error_status,
     _anthropic_stream_should_decline_fallback,
-    _anthropic_stream_error_is_gateway_verdict,
-    _anthropic_stream_forwards_ping_live,
     _anthropic_stream_should_drop_pre_content_ping,
     _is_retriable_anthropic_status,
 )
 from litellm.router_strategy import simple_shuffle
+from litellm.types.llms.openai import ChatCompletionRequest
 from litellm.types.router import Deployment, DeploymentTypedDict, LiteLLM_Params, ModelInfo, RetryPolicy
 
 
@@ -15806,3 +15808,448 @@ async def test_an_open_circuit_breaker_skips_the_session_binding_without_a_warni
     assert binding is None
     assert [record.getMessage() for record in caplog.records if record.levelno >= logging.WARNING] == []
     assert any("circuit breaker is open" in record.getMessage() for record in caplog.records)
+
+
+class TestMemberAutoRouterInference:
+    @pytest.fixture(autouse=True)
+    def fresh_auth_cache(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from litellm.proxy import proxy_server
+        from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+
+        monkeypatch.setattr(proxy_server, "user_api_key_cache", UserApiKeyCache())
+
+    @staticmethod
+    async def _evict_team() -> None:
+        from litellm.proxy import proxy_server
+        from litellm.proxy.auth.auth_checks import delete_cache_team_object
+
+        await delete_cache_team_object(
+            team_id="router-team", team_alias=None,
+            user_api_key_cache=proxy_server.user_api_key_cache, proxy_logging_obj=None,
+        )
+
+    @staticmethod
+    def _team(*, allowed: bool = True, blocked: bool = False, member: bool = True) -> LiteLLM_TeamTable:
+        return LiteLLM_TeamTable(
+            team_id="router-team",
+            models=["member-router", "permitted-model"] if allowed else ["member-router"],
+            blocked=blocked,
+            members_with_roles=[Member(user_id="router-member", role="user")] if member else [],
+        )
+
+    @staticmethod
+    def _db(
+        *teams: LiteLLM_TeamTable | None, groups: tuple[LiteLLM_AccessGroupTable | None, ...] = (),
+    ) -> SimpleNamespace:
+        return SimpleNamespace(db=SimpleNamespace(
+            litellm_teamtable=SimpleNamespace(find_unique=AsyncMock(side_effect=teams)),
+            litellm_teammembership=SimpleNamespace(find_unique=AsyncMock(return_value=None)),
+            litellm_accessgrouptable=SimpleNamespace(find_unique=AsyncMock(side_effect=groups)),
+        ))
+
+    @staticmethod
+    def _marker(
+        *, member: bool = True, target: str = "permitted-model", tags: tuple[str, ...] = (),
+        timeout: float = 13.0, classifier: bool = False,
+    ) -> dict[str, object]:
+        return {
+            "model_name": "model_name_router-team_member-router",
+            "litellm_params": {
+                "model": "auto_router/complexity_router",
+                "complexity_router_config": {
+                    "tiers": dict.fromkeys(("SIMPLE", "MEDIUM", "COMPLEX", "REASONING"), target),
+                    "adaptive": False,
+                    **({"classifier_type": "llm", "classifier_llm_config": {"model": target}}
+                       if classifier else {}),
+                },
+                "complexity_router_default_model": target,
+                "tags": list(tags),
+                "timeout": timeout,
+            },
+            "model_info": {
+                "team_id": "router-team",
+                "team_public_model_name": "member-router",
+                "member_auto_router": member,
+            },
+        }
+
+    @classmethod
+    def _router(cls, *markers: dict[str, object]) -> Router:
+        return Router(model_list=[
+            *(markers or (cls._marker(),)),
+            {"model_name": "permitted-model", "litellm_params": {
+                "model": "openai/gpt-4o-mini", "api_key": "test-key", "api_base": "https://api.openai.com/v1",
+            }},
+            {"model_name": "restricted-model", "litellm_params": {"model": "openai/gpt-4o", "api_key": "test-key"}},
+        ])
+
+    @staticmethod
+    def _request(
+        *, metadata_name: str = "metadata", team_id: str = "router-team",
+        tags: tuple[str, ...] = (), agent_id: str | None = None, session: bool = False,
+        user_id: str | None = "router-member", user_role: LitellmUserRoles = LitellmUserRoles.INTERNAL_USER,
+        project_id: str | None = None,
+        models: tuple[str, ...] = (), access_group_ids: tuple[str, ...] = (),
+    ) -> dict[str, object]:
+        from litellm.proxy.litellm_pre_call_utils import LiteLLMProxyRequestSetup
+
+        actor: Final = UserAPIKeyAuth(
+            user_id=user_id, team_id=team_id, user_role=user_role,
+            team_models=["member-router", "permitted-model"], api_key="test-key-hash",
+            project_id=project_id,
+            models=list(models), access_group_ids=list(access_group_ids),
+        )
+        data: Final[dict[str, object]] = {
+            metadata_name: {"tags": list(tags), "user_api_key_hash": "test-key-hash"},
+            **({"metadata": {"user_api_key_auth": {"user_role": "proxy_admin"}}}
+               if metadata_name == "litellm_metadata" else {}),
+            **({"proxy_server_request": {"headers": {
+                "x-claude-code-session-id": "member-router-session", "x-app": "cli",
+                **({"x-claude-code-agent-id": agent_id} if agent_id else {}),
+            }}} if session else {}),
+        }
+        LiteLLMProxyRequestSetup.add_user_api_key_auth_to_request_metadata(
+            data=data, user_api_key_dict=actor, _metadata_variable_name=metadata_name,
+        )
+        return data
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("metadata_name", ("metadata", "litellm_metadata"))
+    @pytest.mark.parametrize("revocation", ("target", "member"))
+    async def test_real_auth_metadata_rechecks_live_team_targets(
+        self, metadata_name: str, revocation: str, respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("DISABLE_AIOHTTP_TRANSPORT", "True")
+        router: Final = self._router(self._marker(classifier=True))
+        database: Final = self._db(self._team(), self._team(allowed=revocation != "target", member=revocation != "member"))
+        classify: Final = respx_mock.post("https://api.openai.com/v1/chat/completions").mock(
+            return_value=httpx.Response(200, json={
+                "id": "chatcmpl-router-classifier", "object": "chat.completion", "created": 0,
+                "model": "gpt-4o-mini",
+                "choices": [{"index": 0, "message": {"content": '{"tier":"SIMPLE"}', "role": "assistant"},
+                             "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }),
+        )
+        with patch(  # test-quality-ok: [TQ008] inject the serving DB boundary; auth and repositories stay real
+            "litellm.proxy.proxy_server.prisma_client", database
+        ):
+            response: Final = await router.async_pre_routing_hook(
+                model="member-router", request_kwargs=self._request(metadata_name=metadata_name),
+                messages=[{"role": "user", "content": "Hello"}],
+            )
+            assert response is not None and response.model == "permitted-model"
+            assert response.routing_decision is not None and response.routing_decision["cause"] == "llm_classifier"
+            assert classify.call_count == 1
+            cached_response: Final = await router.async_pre_routing_hook(
+                model="member-router", request_kwargs=self._request(metadata_name=metadata_name),
+                messages=[{"role": "user", "content": "Hello"}],
+            )
+            assert cached_response is not None and cached_response.model == "permitted-model"
+            assert classify.call_count == 2
+            assert database.db.litellm_teamtable.find_unique.await_count == 1
+            assert database.db.litellm_teammembership.find_unique.await_count == 1
+            await self._evict_team()
+            with pytest.raises((ProxyException, HTTPException), match=r"not allowed to access model|no longer a member"):
+                await router.async_pre_routing_hook(
+                    model="member-router", request_kwargs=self._request(metadata_name=metadata_name),
+                    messages=[{"role": "user", "content": "Hello"}],
+                )
+            assert classify.call_count == 2
+        assert database.db.litellm_teamtable.find_unique.await_count == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("actor", (None, {"team_id": "router-team", "user_role": "proxy_admin"}))
+    async def test_missing_or_client_forged_auth_never_reaches_member_strategy(self, actor: object) -> None:
+        router: Final = self._router()
+        with pytest.raises(HTTPException, match="authenticated team access") as error:
+            await router.async_pre_routing_hook(
+                model="member-router", request_kwargs={"metadata": {
+                    "user_api_key_team_id": "router-team", "user_api_key_auth": actor,
+                }}, messages=[{"role": "user", "content": "Hello"}],
+            )
+        assert error.value.status_code == 403
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("state", ("blocked", "deleted", "unavailable"))
+    async def test_unavailable_or_blocked_team_fails_closed(self, state: str) -> None:
+        router: Final = self._router()
+        database: Final = None if state == "unavailable" else self._db(
+            None if state == "deleted" else self._team(blocked=True)
+        )
+        with patch(  # test-quality-ok: [TQ008] inject the serving DB boundary; auth and repositories stay real
+            "litellm.proxy.proxy_server.prisma_client", database
+        ):
+            with pytest.raises(HTTPException) as error:
+                await router.async_pre_routing_hook(
+                    model="member-router", request_kwargs=self._request(),
+                    messages=[{"role": "user", "content": "Hello"}],
+                )
+        assert error.value.status_code == (503 if state == "unavailable" else 403)
+
+    @pytest.mark.asyncio
+    async def test_admin_authored_router_retains_delegation_without_dependency_reads(self) -> None:
+        router: Final = self._router(self._marker(member=False, target="restricted-model"))
+        database: Final = self._db()
+        with patch(  # test-quality-ok: [TQ008] inject the serving DB boundary; auth and repositories stay real
+            "litellm.proxy.proxy_server.prisma_client", database
+        ):
+            response: Final = await router.async_pre_routing_hook(
+                model="member-router", request_kwargs={"metadata": {"user_api_key_team_id": "router-team"}},
+                messages=[{"role": "user", "content": "Hello"}],
+            )
+        assert response is not None and response.model == "restricted-model"
+        database.db.litellm_teamtable.find_unique.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("user_id,role,team_id,allowed", [
+        ("router-member", LitellmUserRoles.INTERNAL_USER, "router-team", True),
+        ("router-member", LitellmUserRoles.TEAM, "router-team", True),
+        ("removed-member", LitellmUserRoles.INTERNAL_USER, "router-team", False),
+        ("removed-member", LitellmUserRoles.TEAM, "router-team", False),
+        ("", LitellmUserRoles.INTERNAL_USER, "router-team", False),
+        (None, LitellmUserRoles.INTERNAL_USER, "router-team", True),
+        ("proxy-admin", LitellmUserRoles.PROXY_ADMIN, "router-team", True),
+    ])
+    async def test_member_router_preserves_named_member_service_key_and_admin_principals(
+        self, user_id: str | None, role: LitellmUserRoles, team_id: str, allowed: bool,
+    ) -> None:
+        router: Final = self._router()
+        database: Final = self._db(self._team())
+        request: Final = self._request(user_id=user_id, user_role=role, team_id=team_id)
+        with patch(  # test-quality-ok: [TQ008] inject the serving DB boundary; cached auth and policy remain real
+            "litellm.proxy.proxy_server.prisma_client", database
+        ):
+            if allowed:
+                response: Final = await router.async_pre_routing_hook(
+                    model="member-router", request_kwargs=request, messages=[{"role": "user", "content": "Hello"}],
+                )
+                assert response is not None and response.model == "permitted-model"
+                return
+            with pytest.raises(HTTPException) as denied:
+                await router.async_pre_routing_hook(
+                    model="member-router", request_kwargs=request, messages=[{"role": "user", "content": "Hello"}],
+                )
+            assert denied.value.status_code == 403
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("ceiling", ("member", "organization", "project"))
+    @pytest.mark.parametrize("group_owner", (None, "team", "key"))
+    async def test_member_router_uses_cached_dependency_model_ceilings(
+        self, ceiling: str, group_owner: str | None,
+    ) -> None:
+        from litellm.models.budget import LiteLLM_BudgetTable
+        from litellm.models.organization import LiteLLM_OrganizationTable
+        from litellm.models.team_membership import LiteLLM_TeamMembership
+        from litellm.proxy import proxy_server
+        from litellm.proxy._types import LiteLLM_ProjectTableCachedObj
+        from litellm.proxy.common_utils.user_api_key_cache import team_membership_reservation_cache_key
+
+        router: Final = self._router()
+        database: Final = self._db(self._team(allowed=group_owner != "team").model_copy(update={
+            "organization_id": "router-org" if ceiling == "organization" else None,
+            "access_group_ids": ["router-group"] if group_owner == "team" else [],
+        }), groups=(LiteLLM_AccessGroupTable(
+            access_group_id="router-group", access_group_name="Router targets", access_model_names=["permitted-model"],
+        ),))
+        cache: Final = proxy_server.user_api_key_cache
+        if ceiling == "member":
+            await cache.async_set_cache(
+                key=team_membership_reservation_cache_key(user_id="router-member", team_id="router-team"),
+                value=LiteLLM_TeamMembership(
+                    user_id="router-member", team_id="router-team",
+                    litellm_budget_table=LiteLLM_BudgetTable(allowed_models=["restricted-model"]),
+                ),
+                model_type=LiteLLM_TeamMembership,
+            )
+        elif ceiling == "organization":
+            await cache.async_set_cache(
+                key="org_id:router-org",
+                value=LiteLLM_OrganizationTable(
+                    organization_id="router-org", budget_id="org-budget", created_by="admin", updated_by="admin",
+                    models=["restricted-model"],
+                ),
+                model_type=LiteLLM_OrganizationTable,
+            )
+        else:
+            await cache.async_set_cache(
+                key="project_id:router-project",
+                value=LiteLLM_ProjectTableCachedObj(
+                    project_id="router-project", team_id="router-team", models=["restricted-model"],
+                ),
+                model_type=LiteLLM_ProjectTableCachedObj,
+            )
+        with patch(  # test-quality-ok: [TQ008] inject the serving DB boundary; cached auth and policy remain real
+            "litellm.proxy.proxy_server.prisma_client", database
+        ):
+            with pytest.raises(ProxyException, match="not allowed to access model"):
+                await router.async_pre_routing_hook(
+                    model="member-router", request_kwargs=self._request(
+                        project_id="router-project" if ceiling == "project" else None,
+                        models=("member-router",) if group_owner == "key" else (),
+                        access_group_ids=("router-group",) if group_owner == "key" else (),
+                    ), messages=[{"role": "user", "content": "Hello"}],
+                )
+        assert database.db.litellm_accessgrouptable.find_unique.await_count == (0 if group_owner is None else 1)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("group_owner", ("team", "key"))
+    @pytest.mark.parametrize("revocation", ("empty", "missing"))
+    async def test_member_router_access_group_grants_cache_and_revoke(
+        self, group_owner: str, revocation: str,
+    ) -> None:
+        from litellm.proxy import proxy_server
+        from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import evict_and_broadcast
+
+        router: Final = self._router()
+        group: Final = LiteLLM_AccessGroupTable(
+            access_group_id="router-group", access_group_name="Router targets", access_model_names=["permitted-model"],
+        )
+        database: Final = self._db(
+            self._team(allowed=group_owner != "team").model_copy(update={
+                "access_group_ids": ["router-group"] if group_owner == "team" else [],
+            }),
+            groups=(group, group.model_copy(update={"access_model_names": []}) if revocation == "empty" else None),
+        )
+        request: Final = self._request(
+            models=("member-router",) if group_owner == "key" else ("member-router", "permitted-model"),
+            access_group_ids=("router-group",) if group_owner == "key" else (),
+        )
+        with patch(  # test-quality-ok: [TQ008] inject the serving DB boundary; access-group cache and authorization stay real
+            "litellm.proxy.proxy_server.prisma_client", database
+        ):
+            first: Final = await router.async_pre_routing_hook(
+                model="member-router", request_kwargs=request, messages=[{"role": "user", "content": "Hello"}],
+            )
+            assert first is not None and first.model == "permitted-model"
+            cached: Final = await router.async_pre_routing_hook(
+                model="member-router", request_kwargs=request, messages=[{"role": "user", "content": "Hello"}],
+            )
+            assert cached is not None and cached.model == "permitted-model"
+            assert database.db.litellm_accessgrouptable.find_unique.await_count == 1
+            assert database.db.litellm_teamtable.find_unique.await_count == 1
+            assert database.db.litellm_teammembership.find_unique.await_count == 1
+            await evict_and_broadcast(
+                cache_keys=("access_group_id:router-group",), user_api_key_cache=proxy_server.user_api_key_cache,
+            )
+            with pytest.raises(ProxyException, match="not allowed to access model"):
+                await router.async_pre_routing_hook(
+                    model="member-router", request_kwargs=request, messages=[{"role": "user", "content": "Hello"}],
+                )
+        assert database.db.litellm_accessgrouptable.find_unique.await_count == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("group_owner", ("team", "key"))
+    async def test_member_router_access_group_does_not_override_other_principal_ceiling(self, group_owner: str) -> None:
+        router: Final = self._router()
+        database: Final = self._db(
+            self._team(allowed=False).model_copy(update={
+                "access_group_ids": ["router-group"] if group_owner == "team" else [],
+            }),
+            groups=(LiteLLM_AccessGroupTable(
+                access_group_id="router-group", access_group_name="Router targets", access_model_names=["permitted-model"],
+            ),),
+        )
+        request: Final = self._request(
+            models=("member-router",), access_group_ids=("router-group",) if group_owner == "key" else (),
+        )
+        with patch(  # test-quality-ok: [TQ008] inject the serving DB boundary; access-group cache and authorization stay real
+            "litellm.proxy.proxy_server.prisma_client", database
+        ):
+            with pytest.raises(ProxyException, match="not allowed to access model"):
+                await router.async_pre_routing_hook(
+                    model="member-router", request_kwargs=request, messages=[{"role": "user", "content": "Hello"}],
+                )
+
+    @pytest.mark.asyncio
+    async def test_member_router_key_config_cannot_expand_target_model_access(self) -> None:
+        from litellm.proxy.litellm_pre_call_utils import LiteLLMProxyRequestSetup
+
+        router: Final = self._router()
+        database: Final = self._db(self._team())
+        actor: Final = UserAPIKeyAuth(
+            user_id="router-member", user_role=LitellmUserRoles.INTERNAL_USER, team_id="router-team",
+            models=["member-router"], config={"timeout": 60},
+        )
+        request: Final = LiteLLMProxyRequestSetup.add_user_api_key_auth_to_request_metadata(
+            data={"metadata": {}}, user_api_key_dict=actor, _metadata_variable_name="metadata",
+        )
+        with patch(  # test-quality-ok: [TQ008] inject the serving DB boundary; cached auth and policy remain real
+            "litellm.proxy.proxy_server.prisma_client", database
+        ):
+            with pytest.raises(ProxyException, match="not allowed to access model"):
+                await router.async_pre_routing_hook(
+                    model="member-router", request_kwargs=request,
+                    messages=[{"role": "user", "content": "Hello"}],
+                )
+
+    @pytest.mark.asyncio
+    async def test_sdk_router_runs_without_proxy_auth_dependencies(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        router: Final = self._router(self._marker(member=False))
+        monkeypatch.setitem(sys.modules, "fastapi", None)
+        monkeypatch.delitem(sys.modules, "litellm.proxy.auth.auto_router_checks", raising=False)
+
+        response: Final = await router.async_pre_routing_hook(
+            model="member-router", request_kwargs={"metadata": {"user_api_key_team_id": "router-team"}},
+            messages=[{"role": "user", "content": "Hello"}],
+        )
+
+        assert response is not None and response.model == "permitted-model"
+
+    @pytest.mark.asyncio
+    async def test_authorization_and_forwarded_parameters_follow_the_same_tagged_marker(self) -> None:
+        router: Final = self._router(
+            self._marker(member=False, target="restricted-model", tags=("admin",), timeout=29.0),
+            self._marker(tags=("member",), timeout=13.0),
+        )
+        database: Final = self._db(self._team(), self._team(allowed=False))
+        member_request: Final = self._request(tags=("member",))
+        admin_request: Final = self._request(tags=("admin",))
+        selected_marker: Final = router._selected_strategy_marker_deployment(
+            model="model_name_router-team_member-router", strategy_tags=("member",), request_kwargs=member_request,
+        )
+        assert selected_marker is not None
+        assert selected_marker["litellm_params"]["timeout"] == 13.0
+        assert selected_marker["model_info"]["member_auto_router"] is True
+        with patch(  # test-quality-ok: [TQ008] inject the serving DB boundary; auth and repositories stay real
+            "litellm.proxy.proxy_server.prisma_client", database
+        ):
+            member_response: Final = await router.async_pre_routing_hook(
+                model="member-router", request_kwargs=member_request,
+                messages=[{"role": "user", "content": "Hello"}],
+            )
+            admin_response: Final = await router.async_pre_routing_hook(
+                model="member-router", request_kwargs=admin_request,
+                messages=[{"role": "user", "content": "Hello"}],
+            )
+            await self._evict_team()
+            with pytest.raises(ProxyException, match="not allowed to access model"):
+                await router.async_pre_routing_hook(
+                    model="member-router", request_kwargs=self._request(tags=("member",)),
+                    messages=[{"role": "user", "content": "Hello"}],
+                )
+        assert member_response is not None and member_response.model == "permitted-model"
+        assert member_request["timeout"] == 13.0
+        assert admin_response is not None and admin_response.model == "restricted-model"
+        assert admin_request["timeout"] == 29.0
+        assert database.db.litellm_teamtable.find_unique.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_claude_session_rebinding_reauthorizes_member_router_after_revocation(self) -> None:
+        router: Final = self._router()
+        database: Final = self._db(self._team(), self._team(allowed=False))
+        with patch(  # test-quality-ok: [TQ008] inject the serving DB boundary; auth and repositories stay real
+            "litellm.proxy.proxy_server.prisma_client", database
+        ):
+            response: Final = await router.async_pre_routing_hook(
+                model="member-router", request_kwargs=self._request(session=True),
+                messages=[{"role": "user", "content": "Hello"}],
+            )
+            assert response is not None and response.model == "permitted-model"
+            await self._evict_team()
+            with pytest.raises(ProxyException, match="not allowed to access model"):
+                await router.async_pre_routing_hook(
+                    model="restricted-model", request_kwargs=self._request(session=True, agent_id="subagent"),
+                    messages=[{"role": "user", "content": "Hello"}],
+                )
+        assert database.db.litellm_teamtable.find_unique.await_count == 2

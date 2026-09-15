@@ -34,8 +34,9 @@ vi.mock("@/components/team/TeamInfo", () => ({
 }));
 
 const mockUseAuthorized = vi.fn();
+const mockUseTeams = vi.fn();
 vi.mock("@/app/(dashboard)/hooks/useAuthorized", () => ({ default: () => mockUseAuthorized() }));
-vi.mock("@/app/(dashboard)/hooks/teams/useTeams", () => ({ useTeams: () => ({ data: [] }) }));
+vi.mock("@/app/(dashboard)/hooks/teams/useTeams", () => ({ useTeams: () => mockUseTeams() }));
 vi.mock("@/app/(dashboard)/hooks/uiSettings/useUISettings", () => ({
   useUISettings: () => ({ data: { values: {} } }),
 }));
@@ -69,6 +70,7 @@ describe("ModelsAndEndpointsPage", () => {
     detailState.modelId = null;
     detailState.teamId = null;
     mockUseAuthorized.mockReturnValue(ADMIN);
+    mockUseTeams.mockReturnValue({ data: [] });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (global as any).ResizeObserver = class {
       observe() {}
@@ -83,6 +85,23 @@ describe("ModelsAndEndpointsPage", () => {
     expect(screen.getByRole("tab", { name: "LLM Credentials" })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "Health Status" })).toBeInTheDocument();
     expect(screen.getByTestId("panel-all-models")).toBeInTheDocument();
+  });
+
+  it("opens Auto-Routers for an opted-in member without exposing Add Model", async () => {
+    mockUseAuthorized.mockReturnValue(NON_ADMIN);
+    mockUseTeams.mockReturnValue({
+      data: [
+        {
+          team_id: "team-1",
+          members_with_roles: [{ user_id: "u1", role: "user" }],
+          team_member_permissions: ["/auto_router/manage"],
+        },
+      ],
+    });
+    renderPage();
+    await userEvent.click(screen.getByRole("tab", { name: /Auto-Routers/ }));
+    expect(screen.getByTestId("panel-auto-routers")).toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: "Add Model" })).not.toBeInTheDocument();
   });
 
   it("switches tabs in-memory, mounting only the active panel", async () => {

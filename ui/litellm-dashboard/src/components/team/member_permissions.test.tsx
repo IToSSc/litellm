@@ -95,6 +95,25 @@ describe("MemberPermissions", () => {
     });
   });
 
+  it("opts a team into member auto routers while retaining existing permissions", async () => {
+    vi.mocked(networking.getTeamPermissionsCall).mockResolvedValue({
+      all_available_permissions: ["/key/generate", "/auto_router/manage"],
+      team_member_permissions: ["/key/generate"],
+    });
+    renderWithProviders(<MemberPermissions teamId="team-123" accessToken="token-123" canEditTeam />);
+    expect(
+      await screen.findByText("Member can create auto routers for this team and edit their own router configurations"),
+    ).toBeInTheDocument();
+    fireEvent.click(checkboxFor("/auto_router/manage"));
+    fireEvent.click(await screen.findByRole("button", { name: /save changes/i }));
+    await waitFor(() =>
+      expect(networking.teamPermissionsUpdateCall).toHaveBeenCalledWith("token-123", "team-123", [
+        "/key/generate",
+        "/auto_router/manage",
+      ]),
+    );
+  });
+
   it("should render team daily activity permission with correct method and description", async () => {
     vi.mocked(networking.getTeamPermissionsCall).mockResolvedValue({
       all_available_permissions: ["/key/generate", "/team/daily/activity"],
