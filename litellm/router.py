@@ -1622,6 +1622,15 @@ class Router:
             return
         await selector.async_pre_call_check(deployment, parent_otel_span)
 
+    def _bind_override_selector_to_request(
+        self, strategy: str, selector: RouterStrategySelector | None, request_kwargs: Mapping[str, object] | None
+    ) -> None:
+        if selector is None or request_kwargs is None or strategy == self._normalize_strategy(self.routing_strategy):
+            return
+        logging_obj: Final = request_kwargs.get("litellm_logging_obj")
+        if isinstance(logging_obj, LiteLLMLogging):
+            logging_obj.add_dynamic_callback(selector)
+
     def _get_routing_context(
         self, model: str, request_kwargs: dict | None = None
     ) -> tuple[str | None, RouterStrategySelector | None]:
@@ -1647,7 +1656,9 @@ class Router:
         override: Final = self._get_request_routing_strategy_override(request_kwargs)
         if override is not None:
             verbose_router_logger.debug("routing_group=request-override model=%s strategy=%s", model, override)
-            return override, self._get_override_strategy_selector(override)
+            override_selector: Final = self._get_override_strategy_selector(override)
+            self._bind_override_selector_to_request(override, override_selector, request_kwargs)
+            return override, override_selector
 
         group_name: Final = model if self.get_routing_group(model) is not None else self._model_to_group.get(model)
         if group_name is None:
